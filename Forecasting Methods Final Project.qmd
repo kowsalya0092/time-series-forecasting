@@ -1,0 +1,1126 @@
+---
+title: "Forecasting Methods - Final Project"
+author: "Kowsalya Muralidharan"
+format: 
+  html:
+    fig-align: center # Center figure alignment
+    embed-resources: true # Force document to be self-contained (critical!)
+    code-fold: true # Turn on code fold
+self-contained: TRUE
+editor: visual
+embed-resources: true
+execute: 
+  warning: false # Turn off warnings
+theme: "pulse"
+toc: true
+---
+::: {.panel-tabset .nav-pills}
+
+## Section 1 - Exploratory Data analysis and Time Series Decomposition
+
+#### About the Data
+
+```{r,message=FALSE}
+#| warning: false
+library(slider)
+library(lubridate)
+library(tsibble)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(tidyr)
+library(patchwork)
+library(lubridate)
+library(knitr)
+library(fpp3)
+library(psych)
+library(forecast)
+library(urca)
+library(data.table)
+library(fable)
+library(fable.prophet)
+library(changepoint)
+
+```
+
+The time series dataset analyzed in the below assignment is Traffic Crash Reports recorded in the event of a Cincinnati Police Department response to a traffic crash, which includes records of data, injury and non-injury crashes. The dataset is updated on a daily basis and is available to the public through the city's Open Data portal.
+
+The data-generation process is performed by recording the event of CPD responding to a traffic crash. The variation in variable (number of crashes) is reliant on a number of factors - traffic patterns, weather, attention of the rider, road conditions and many more. In my opinion, this is a difficult variable to forecast, owing to the complexity of traffic dynamics and the influence of external factors. Furthermore, having different types of crashes makes it more difficult to predict an identifiable pattern.
+
+```{r}
+
+accidents <- read.csv("C:\\Users\\kowsa\\Downloads\\cpd_crashes.csv")
+
+
+accidents$date <- ymd(accidents$date)
+
+accidents_tsbl<- accidents %>%
+as_tsibble(index=date) %>%
+mutate(date = ymd(accidents$date))
+
+
+accidents_tsbl
+```
+
+The data-frame has been converted to a 'tsibble' format to handle date functions. Let's plot the number of traffic crashes against each day of the year.
+
+```{r}
+
+accidents_plot <- accidents_tsbl %>%
+  ggplot() +
+  geom_line(aes(date, cpd_crashes)) +
+  theme_bw() +
+  xlab("Date") +
+  ylab("Traffic Crashes in Cincinnati") +
+  ggtitle("Number of traffic crashes over time")
+
+accidents_plot
+
+```
+
+#### Summary statistics
+
+From the summary statistics below, we can see that the median and mean are not close to each other, suggesting skewness in the data. The maximum value is 189, which seems to be fairly relieving as compared to most other cities.
+
+```{r}
+summary_stat <- round(t(describe(accidents_tsbl$cpd_crashes)),2)
+
+summary_stat <- cbind('Summary Statistics are ' = rownames(summary_stat), summary_stat)
+row.names(summary_stat) <- NULL
+colnames(summary_stat) <- c('Summary Statistics','Value')
+summary_stat[-c(1,12),]  %>%
+  kbl(align=rep('c', 2)) %>%
+  kable_styling()
+```
+
+```{r}
+hist <- accidents_tsbl %>%
+  ggplot() +
+  geom_histogram(aes(cpd_crashes)) +
+  theme_bw()
+
+dens <- accidents_tsbl %>%
+  ggplot() +
+  geom_density(aes(cpd_crashes)) +
+  theme_bw()
+
+violin <- accidents_tsbl %>%
+  ggplot() +
+  geom_violin(aes("", cpd_crashes)) +
+  theme_bw()
+
+boxplot <- accidents_tsbl %>%
+  ggplot() +
+  geom_boxplot(aes("", cpd_crashes)) +
+  theme_bw()
+
+hist + violin + dens + boxplot +  plot_annotation(title = 'Density plots for Cincinnati traffic crashes')
+```
+-   As expected, the histogram above is right-skewed with a long tail, and follows an almost-normal distribution with a sudden peak.
+
+-   The density graph also shows a right-tailed normal distribution.
+
+-   The box-plot shows a few outliers which may be the reason for skewness in the data.
+
+-   From the violin plot, we can infer that there is higher density of traffic crashes around the value 75.
+
+-   There seems to be a decrease in the number of traffic crashes lately. However, there does not seem to be a clear trend in the data yet.
+
+Before visualizing moving averages, let's perform rolling standard deviation to check for the variance trend. From below plot, we can observe that there are multiple peaks and fall, however, there is no increasing or decreasing trend implying an overall constant variance.
+
+```{r}
+#Rolling standard deviation
+
+accidents_tsbl %>%
+mutate(
+  sd = slider::slide_dbl(cpd_crashes, sd,.before = 3, .after = 3, .complete = TRUE)
+) %>%
+ggplot()+
+geom_line(aes(date,sd),linewidth=0.5,na.rm=TRUE)+
+ggtitle('Rolling Standard Deviation of Cincinnati Crashes',
+subtitle = 'Long-term Variance Fairly Constant with some fluctuations')+ theme_bw() +
+ylab('Weekly Rolling Standard Deviation')
+```
+As there are many peaks and valleys, we can perform transformations to reduce the variance in the data. Log transformation has been performed as shown below, and we can see the density curve showing satisfactory results. Hence, we can proceed with the log-transformed value of the number of crashes.
+
+#### Transformations (Log/Box-cox)
+
+```{r}
+#Performing transformations to reduce variance
+density = accidents_tsbl %>%
+ggplot()+
+geom_density(aes(cpd_crashes))+
+geom_vline(aes(xintercept=mean(cpd_crashes)),linetype='dashed',color='red')
+
+line = accidents_tsbl %>%
+ggplot()+
+geom_line(aes(date,cpd_crashes))+
+geom_smooth(aes(date,cpd_crashes),method='lm')
+
+log_density = accidents_tsbl %>%
+ggplot()+
+geom_density(aes(log(cpd_crashes)))+
+geom_vline(aes(xintercept=mean(log(cpd_crashes))),linetype='dashed',color='red')
+
+log_line = accidents_tsbl %>%
+ggplot()+
+geom_line(aes(date,log(cpd_crashes)))+
+geom_smooth(aes(date,log(cpd_crashes)),method='lm')
+
+
+density + line + log_density + log_line+ plot_layout(ncol = 2, byrow = TRUE) + plot_annotation(title = "Comparison of Density and Line Plots before/after Log Transformation")
+
+accidents_tsbl <- accidents_tsbl %>%
+mutate(accidents_log = log(cpd_crashes))
+accidents_tsbl
+```
+#### Estimating moving averages
+
+We can now perform moving averages on the log-transformed data. Intuitively, moving average of 7th order would be an ideal choice, given the nature of our data. Let's plot to compare the moving averages.
+
+```{r}
+#| warning: false
+
+accidents_tsbl_ma <- accidents_tsbl %>%
+  arrange(date) %>%
+  mutate(
+    ma_right = slider::slide_dbl(accidents_log, mean,
+                .before = 12, .after = 0, .complete = TRUE),
+    ma_left = slider::slide_dbl(accidents_log, mean,
+                .before = 0, .after = 12, .complete = TRUE),
+    ma_center = slider::slide_dbl(accidents_log, mean,
+                .before = 6, .after = 6, .complete = TRUE),
+    ma_3 = slider::slide_dbl(accidents_log, mean,
+                .before = 1, .after = 1, .complete = TRUE),
+    ma_5 = slider::slide_dbl(accidents_log, mean,
+                .before = 2, .after = 2, .complete = TRUE),
+    ma_7 = slider::slide_dbl(accidents_log, mean,
+                .before = 3, .after = 3, .complete = TRUE),
+    ma_13 = slider::slide_dbl(accidents_log, mean,
+                .before = 6, .after = 6, .complete = TRUE),
+    ma_25 = slider::slide_dbl(accidents_log, mean,
+                .before = 12, .after = 12, .complete = TRUE),
+    ma_49 = slider::slide_dbl(accidents_log, mean,
+                .before = 24, .after = 24, .complete = TRUE))
+  
+
+accidents_tsbl_ma_pivot <- accidents_tsbl_ma %>%
+  pivot_longer(
+    cols = ma_right:ma_49,
+    values_to = "value_ma",
+    names_to = "ma_order"
+  ) %>%
+  mutate(ma_order = factor(
+    ma_order,
+    levels = c(
+      "ma_center",
+      "ma_left",
+      "ma_right",
+      "ma_3",
+      "ma_5",
+      "ma_7",
+      "ma_13",
+      "ma_25",
+      "ma_49"
+    ),
+    labels = c(
+      "ma_center",
+      "ma_left",
+      "ma_right",
+      "ma_3",
+      "ma_5",
+      "ma_7",
+      "ma_13",
+      "ma_25",
+      "ma_49"
+    )
+  ))
+
+accidents_tsbl_ma %>%
+  ggplot() +
+  geom_line(aes(date, accidents_log), linewidth =0.5, color="black") +
+  geom_line(aes(date, ma_7), linewidth = 0.75, color = "red") +
+  geom_smooth(aes(date, accidents_log), method = "lm", se = F, color = "blue") +
+  theme_bw()+
+  ylab('CPD crashes')+ ggtitle("Estimation of Moving Averages")
+```
+
+Now, let's plot the moving averages with 7th and 13th order to compare which fits better.
+
+```{r}
+#Moving averages with order
+accidents_tsbl_ma_pivot %>%
+  filter(
+    !ma_order %in% c(
+      "ma_center",
+      "ma_left",
+      "ma_right",
+      "ma_3",
+      "ma_5",
+      "ma_25",
+      "ma_49"
+    )
+  ) %>%
+  mutate(ma_order = case_when(
+    ma_order=='ma_7' ~ '7th Order',
+    ma_order=='ma_13'~'13th Order'
+
+   )
+  ) %>%
+  mutate(
+    ma_order = factor(
+      ma_order,
+      labels = c(
+       '7th Order',
+      '13th Order'),
+      
+      levels = c(
+      '7th Order',
+       '13th Order'
+     )
+    )
+  ) %>%
+  ggplot() +
+  geom_line(aes(date, accidents_log), size = 0.5,na.rm=TRUE) +
+  geom_line(aes(date, value_ma, color = ma_order), size = 0.75,na.rm=TRUE,se=F) +
+    scale_color_discrete(name = 'MA Order')+
+  theme_minimal()+
+  ylab('Cincinnati Traffic crashes')+ ggtitle("Comparison of moving averages of different orders",subtitle = "Moving average of 7th order fits better")
+```
+
+From the above graph, we can conclude that 7th order Moving average seems to fit the best among all other orders.
+
+#### Performing Linear regression
+
+Now, let's perform linear regression to fit our data appropriately.
+
+```{r}
+#| warning: false
+#Linear model
+accidents_tsbl_ma %>%
+  ggplot() +
+  geom_line(aes(date, ma_7)) +
+  geom_smooth(aes(date, ma_7), method = "lm", color = "red")+ 
+  theme_bw() +
+  xlab("Date") +
+  ylab("Cincinnati crashes")
+
+accidents_mod <- lm(accidents_log~ date, data = accidents_tsbl)
+summary(accidents_mod)
+```
+
+Since linear model does not really fit our data appropriately, let's try fitting a polynomial function instead.
+
+```{r}
+ggplot(accidents_tsbl, aes(x = date, y = accidents_log)) +
+  geom_line() +
+  # Plot the fitted curve from the polynomial regression model
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3), se = FALSE, color = "blue") +
+  # Other plot customization options
+  labs(title = "Polynomial Regression of accidents_log",
+       x = "Date",
+       y = "accidents_log") +
+  theme_minimal()
+accidents_mod2 <- lm(accidents_log ~ poly(date,3), data = accidents_tsbl)
+summary(accidents_mod2)
+```
+
+Let's calculate the residuals of our fitted model, just to visualize the behaviour. We do not see a particular trend in the residuals.
+
+```{r}
+accidents_resid = accidents_tsbl %>%
+  mutate(
+    pred = predict(accidents_mod2),
+    resid = pred - accidents_log
+  ) 
+
+accidents_resid_plot = accidents_resid %>%
+  ggplot() +
+  geom_line(aes(date, resid),na.rm=TRUE)+
+  theme_bw()+
+  ylab('Residuals') + ggtitle(" Plot of residuals from Polynomial Model")
+
+accidents_resid_plot
+
+```
+
+#### Classical decomposition
+
+Classical decomposition has been performed for the dataset to separate the trend, seasonality and residuals from the data as seen below. From the remainder component, we can see that there seems to be some seasonality in the data which can be modeled. This is not surprising as we could expect the traffic crashes to be seasonal, especially few days of the week like weekends which could have more traffic.
+
+```{r}
+accidents_decomp <- accidents_tsbl %>%
+  mutate(
+    ma_7 = slider::slide_dbl(accidents_log, mean,
+                .before = 3, .after = 3, .complete = TRUE),
+  ) %>%
+  mutate(resid = accidents_log - ma_7) %>%
+  select(date, accidents_log, ma_7, resid)
+
+accidents_decomp_plot <- accidents_decomp %>%
+  pivot_longer(
+    accidents_log:resid,
+    names_to = "decomposition",
+    values_to = "accidents_log"
+  ) %>%
+  mutate(
+    decomposition = case_when(
+      decomposition == "accidents_log" ~ "Cincinnati crashes",
+      decomposition == "ma_7" ~ "Trend",
+      decomposition == "resid" ~ "Remainder"
+    )
+  ) %>%
+  mutate(
+    decomposition = factor(
+      decomposition,
+      labels = c(
+        "Cincinnati crashes",
+        "Trend",
+        "Remainder"
+      ),
+      levels = c(
+        "Cincinnati crashes",
+        "Trend",
+        "Remainder"
+      )
+    )
+  ) %>%
+  ggplot() +
+  geom_line(aes(date, accidents_log), size = 0.75,na.rm=TRUE) +
+  facet_wrap(
+    ~decomposition,
+    nrow = 3,
+    scales = "free"
+  ) +
+  theme_bw() +
+  ylab("") +
+  xlab("Date") +
+  ggtitle(
+    "Cincinnati Traffic crashes = Trend + Remainder"
+  )
+
+accidents_decomp_plot
+```
+
+For further analysis, let's plot the additive seasonality to better visualize the decomposition and other trends in the data.
+
+```{r}
+accidents_add = accidents_tsbl %>%
+  model(
+    classical_decomposition(accidents_log, 'additive')
+  ) %>%
+  components()
+
+accidents_add%>%
+  autoplot()
+
+```
+
+From the lag plots below, we can see that there is negligible seasonality, however we cannot strongly conclude the seasonality based on the decomposition model, as it outputs seasonality even when it is non-existent in the time series. From the below plot, we can presume additive seasonality (however minimum it is).
+
+```{r}
+accidents_add %>%
+  gg_lag(random, geom = "point", lags = 1:12)+
+  geom_smooth(aes(color=NULL),method='lm',color='red',se=F)
+```
+
+Multiplicative seasonality plots do not show a significant change from that of additive plot. This shows that whatever seasonality that exists is well described by our additive model.
+
+```{r}
+accidents_mul = accidents_tsbl %>%
+  model(
+    classical_decomposition(accidents_log,'multiplicative')
+  ) %>%
+  components() 
+
+accidents_mul %>%
+  autoplot()
+```
+
+```{r}
+accidents_decomp %>%
+  mutate(month = month(date)) %>%
+  ggplot() +
+  geom_boxplot(aes(factor(month), resid)) +
+  theme_bw() +
+  ylab('Remainder') +
+  xlab('Month') +
+  scale_x_discrete(labels = month.name) +
+  labs(title = 'Boxplot of Remainder by Month')
+```
+
+Since we have only one year of data, let's see if we can find any weekly seasonality.
+
+```{r}
+accidents_decomp %>%
+  mutate(week = week(date)) %>%
+  ggplot() +
+  geom_boxplot(aes(factor(week), resid)) +
+  theme_bw() +
+  ylab('Remainder') +
+  xlab('Week') +
+  labs(title = 'Boxplot of Remainder by Week') +
+    geom_hline(yintercept=0,color='red') +  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+```
+
+From the above graph, we can see that there is clear weekly seasonality left in the remainder component of the de-trended data.
+
+```{r}
+accidents_tsbl %>%
+mutate(ma = slider::slide_dbl(accidents_log, mean,
+                .before = 3, .after = 3, .complete = TRUE)) %>%
+mutate(detrend = accidents_log - ma) %>%
+mutate(month = lubridate::month(date,label=T,abbr=T)) %>%
+  ggplot()+
+  geom_boxplot(aes(month,detrend))+
+  geom_hline(yintercept=0,color='red') + ggtitle("Boxplot of detrended data ")
+```
+
+From this, we can conclude that there is weekly seasonality in the data and we shall use this feature in our further analysis.
+
+#### Training and Test Data
+
+Let's split our data into training and test data set for further analysis. Here, 80% of that data has been used for training and the rest for testing purposes.
+
+```{r}
+accidents_tsbl %>%
+    ggplot()+
+    geom_line(aes(date,cpd_crashes))+
+    labs(title = 'Split train and test data')+
+    geom_vline(aes(xintercept=ymd('2023-10-19')),color='red')+
+    theme_bw()
+
+train <- accidents_tsbl %>%  
+  filter(date<ymd('2023-10-19'))
+
+# Test set
+test <- accidents_tsbl %>% 
+  filter(date>=ymd('2023-10-19'))
+```
+
+## Section 2 - ARIMA Modeling
+
+#### Stationarity checks
+
+Now let's check if our data is mean stationary.
+
+```{r}
+accidents_tsbl_roll <- train %>%
+  mutate(
+    accidents_mean = slide_dbl(
+      cpd_crashes, 
+      mean,
+      .before=6,
+      .after=6,
+      .complete=T),
+    accidents_sd = slide_dbl(
+      cpd_crashes, 
+      sd,
+      .before=6,
+      .after=6)
+  )
+
+accidents_tsbl_roll_mean <- accidents_tsbl_roll %>%
+  ggplot() +
+    geom_line(aes(date, cpd_crashes)) +
+  geom_line(aes(date, accidents_mean),color='blue') +
+  theme_bw() +
+  ggtitle("Cincinnati Crashes over Time (12 month rolling window)") +
+  ylab("Accidents") +
+  xlab("Date")
+
+accidents_tsbl_roll_mean
+
+```
+
+It seems to be mean stationary. Let's conduct the KPSS Test for stationarity.
+
+```{r}
+accidents_diff <- train %>%
+  mutate(
+    accidents_log = log(cpd_crashes),
+    cpd_diff = cpd_crashes - lag(cpd_crashes),
+    accidents_log_diff = accidents_log - lag(accidents_log)) %>%
+  drop_na() %>%
+  as_tsibble(index=date)
+
+# Raw close value - Non-stationary
+raw_value_kpss = accidents_diff %>% 
+features(cpd_crashes, unitroot_kpss)
+
+# First difference - **Non-stationary**
+diff_value_kpss = accidents_diff %>% 
+features(cpd_diff, unitroot_kpss)
+
+# Log close value - Non-stationary
+log_value_kpss = accidents_diff %>%
+features(accidents_log, unitroot_kpss)
+
+# Differenced log close value - Stationary
+log_diff_kpss = accidents_diff %>%
+features(accidents_log_diff, unitroot_kpss)
+
+log_value_kpss
+```
+
+Since the p-value in the KPSS test is \> 0.05, we can conclude that the time series is mean stationary. This means we do not need to perform any additional steps to induce mean stationarity in the series.
+
+#### Seasonal differencing 
+
+Since our data shows seasonality, let's perform seasonal differencing. 
+
+```{r}
+train %>%
+  gg_tsdisplay(difference(log(cpd_crashes),12),
+               plot_type='partial', lag=24) +
+  labs(title="Seasonally differenced (log)", y="")
+```
+
+-   As we can see dampening effect in the ACF plot, we can conclude that the log-transformed time series is an auto-regressive process.
+
+-   The PACF plot shows the first lag period captures the most significant portion of the auto-regressive property, so it could be AR(1) process.
+
+-   We can see a statistically significant spike at lag 12 as well as 23, indicating seasonality.
+
+-   Since there differencing applied above, we propose that a model of ARIMA(2,1,3)(0,0,1) would be reasonable for this time series.
+
+Now, let's fit our data into ARIMA model on auto ARIMA to see if we get the same result.
+
+```{r}
+# Automatic Differencing using fable
+best_mod = train %>%
+model(
+  mod1 <- fable::ARIMA(log(cpd_crashes),approximation=F,stepwise=F) # Takes a while for approximation=F,stepwise=F to run
+)
+
+best_mod %>%
+report()
+
+```
+
+Here, we can see that the best model is ARIMA(2,0,3)(0,0,1). Now let's build and compare few models.
+
+#### Model building and comparison
+
+```{r}
+models_bic = train %>%
+  model(
+    mod1 = ARIMA(log(cpd_crashes)~pdq(2,0,3)+ PDQ(0,0,1)),
+    mod2 = ARIMA(log(cpd_crashes)~pdq(2,0,2)+ PDQ(0,0,1)),
+    mod3 = ARIMA(log(cpd_crashes)~pdq(0,1,2)+ PDQ(0,0,0)),
+    mod4 = ARIMA(log(cpd_crashes)~pdq(2,1,1)+ PDQ(0,1,1)),
+    mod5 = ARIMA(log(cpd_crashes)~pdq(1,1,2)+ PDQ(0,0,0)),
+    mod6 = ARIMA(log(cpd_crashes)~pdq(0,1,2)+ PDQ(0,0,1)),
+    mod7= ARIMA(log(cpd_crashes)~pdq(2,0,0)+ PDQ(0,0,1))
+  )
+
+models_bic %>%
+  glance() %>%
+  arrange(BIC)
+```
+
+Based on the BIC, Model 3 (0,1,2)(0,0,0) is the best. Hence, we will use this model for our further analysis.
+
+```{r}
+
+best_model_arima = train %>%
+model(
+  mod1 = ARIMA(log(cpd_crashes)~pdq(0,1,2)+ PDQ(0,0,0))  
+)
+
+    
+```
+
+The in-sample predicted values tend to follow the trends in the data.
+
+```{r}
+best_model_arima %>%
+  gg_tsresiduals()
+```
+
+-   From the above plot, we can see that the residuals are normally distributed.
+
+-   The model is well-fitted as we do not see any significant autocorrelation at lag 1 in the ACF plot.
+
+-   There are some seasonal components in the ACF residual plot.
+
+Now, let's perform the Ljung-Box Test to check for any leftover autocorrelation in the residuals.
+
+```{r}
+best_model_arima %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 10, dof = 1)
+```
+
+-   The p-value is \> 0.05, indicating that there is not residual auto-correlation and that the residuals are white noise.
+
+```{r}
+best_model_arima %>%
+  forecast(h=74) %>%
+  autoplot(accidents_tsbl)+
+  ylab('74 day Forecast of CPD Crashes')+
+  ylim(0,150)
+```
+
+-   The forecast values does seem reasonable, given the beginning of new year 2024, there may be more traffic and visitors in Cincinnati, leading to more number of potential crashes.
+
+## Section 3 - Meta Prophet Model
+
+#### Initial Prophet Model
+
+```{r}
+train %>%
+model(prophet = fable.prophet::prophet(accidents_log)) %>%
+forecast(h=74) %>%
+autoplot(accidents_tsbl)
+```
+
+By looking at this forecast, we can see that it does not accurately capture the trend. For further analysis, let's perform time-series decomposition on our model.
+
+```{r}
+model = train %>%
+    model(prophet = fable.prophet::prophet(accidents_log))
+
+model %>%
+components() %>%
+autoplot()
+```
+
+#### Changepoints detection 
+
+To detect critical changepoints in our time-series trend, we will first plot automated changepoint detection.
+
+```{r}
+changepoints = model %>%
+glance() %>%
+pull(changepoints) %>%
+bind_rows() %>%
+.$changepoints
+
+train %>%
+ggplot()+
+geom_line(aes(date,cpd_crashes))+
+# geom_vline(aes(xintercept=ymd('2000-01-01')))
+geom_vline(xintercept=as.Date(changepoints),color='red',linetype='dashed')+
+  labs(title = 'Automatic changepoints')
+```
+
+-   This seems to accurately follow our trend line, but let's modify some parameters to fine-tune the changepoints parameter. Here, several combinations of changepoints have been tested.
+
+-   Based on the information we have for now, let's set the growth type for our time-series data as 'linear'.
+
+    ```{r}
+    # Number of Changepoints
+
+    model = train %>%
+        model(
+            prophet_orig = fable.prophet::prophet(accidents_log~growth(type= "linear")+season(period='week')),
+            
+            prophet_5 = fable.prophet::prophet(accidents_log~growth(type="linear",n_changepoints=5)+season(period='week')),
+            
+        prophet_90_range = fable.prophet::prophet(accidents_log~growth(changepoint_range=0.9)+season(period='week'))
+    )
+
+    changepoints_orig = model %>%
+    glance() %>%
+    filter(.model == 'prophet_orig') %>%
+    pull(changepoints) %>%
+    bind_rows() %>%
+    filter(abs(adjustment)>0.01) %>%
+    .$changepoints
+
+    prophet_5 = model %>%
+    glance() %>%
+    filter(.model == 'prophet_5') %>%
+    unnest(changepoints) %>%
+    bind_rows() %>%
+    filter(abs(adjustment)>=0.01) %>%
+    .$changepoints
+
+    changepoints_90_range = model %>%
+    glance() %>%
+    filter(.model == 'prophet_90_range') %>%
+    unnest(changepoints) %>%
+    bind_rows() %>%
+    filter(abs(adjustment)>=0.01) %>%
+    .$changepoints
+
+    model %>%
+    forecast(h=30) %>%
+    autoplot(train,level=NULL)+
+    geom_vline(xintercept=as.Date(changepoints_orig),color='blue',linetype='dashed')+
+    geom_vline(xintercept=as.Date(changepoints_90_range),color='red',linetype='dashed') +
+    geom_vline(xintercept=as.Date(prophet_5),color='darkgreen',linetype='dashed') +
+      labs(title = 'Changepoints comparison')
+    ```
+
+It is intuitive that number of crashes cannot be negative. Therefore, it can be said with certainty that our floor value has to be '0'. However, to determine the cap value, we need to look at the highest number of crashes throughout the year and intuitively decide on the value. Here, the capacity has been set to 750 and floor to 0.
+
+#### Saturation Model
+
+```{r}
+train %>%
+    model(
+        prophet_orig = fable.prophet::prophet(accidents_log),
+        prophet_saturating = fable.prophet::prophet(accidents_log~growth(type='linear',capacity=750,floor=0,changepoint_range=0.9)+season('week'))
+        ) %>%
+    components() %>%
+
+    autoplot(trend)
+```
+
+Based on the trend, we can also conclude that it makes more sense to reduce the number of changepoints to changepoint_range=0.9.
+
+#### Prophet Decomposition 
+
+Based on the Prophet decomposition plot, we see that there is some weekly seasonality. Let's further analyse to identify the seasonal properties of our data.
+
+```{r}
+model = train %>%
+    model(prophet = fable.prophet::prophet(accidents_log))
+
+model %>%
+components() 
+```
+
+```{r}
+weekly_seasonality = model %>%
+components() %>%
+as_tibble() %>%
+mutate(wday = lubridate::wday(date,label = TRUE,abbr=T)) %>%
+group_by(wday) %>%
+summarize(weekly = mean(weekly,na.rm=T)) %>%
+ungroup() %>%
+ggplot()+
+geom_line(aes(wday,weekly,group=1))
+
+yearly_seasonality = model %>%
+components() %>%
+autoplot(yearly)
+
+yearly_seasonality / weekly_seasonality
+```
+
+Based on the peaks and troughs in the above plot, we see that our data has some seasonality associated with it. Additionally, we can reiterate that weekly seasonality is present based on the above graphs.
+
+#### Additive vs. Multiplicative
+
+```{r}
+model = train %>%
+    model(
+      additive = fable.prophet::prophet(accidents_log~growth(type="linear",changepoint_range=0.9,capacity=750,floor=0)+season(period='week',type='additive')),
+      multiplicative = fable.prophet::prophet(accidents_log~growth(type="linear",changepoint_range=0.9,capacity=750,floor=0)+season(period='week',type='multiplicative')))
+
+model %>%
+components() %>%
+autoplot()
+```
+
+Looking at the additive seasonality plot, it seems that seasonality is present in general because some weeks are clearly higher and lower than others within a year. Time series having multiplicative seasonality usually has differently sized peaks and troughs. Based on the above plots, we can conclude that our model has additive seasonality.
+
+```{r}
+model %>%
+forecast(h=14) %>%
+autoplot(level=NULL)
+```
+
+#### Prophet Holidays
+
+Since we are dealing with daily data, it makes sense to consider the holidays in our dataset.
+
+```{r}
+holidays = tibble(
+  holiday = c('Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday',
+  'Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday',
+  'Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday',
+  'Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday',
+  'Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday',
+  'Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday'),
+  Date = ymd(c(
+  '2018-12-25','2018-01-01','2018-01-15','2018-02-19','2018-05-28','2018-07-04','2018-09-03','2018-10-08','2018-11-12','2018-11-22','2018-02-19',
+  '2019-12-25','2019-01-01','2019-01-15','2019-02-19','2019-05-28','2019-07-04','2019-09-03','2019-10-08','2019-11-12','2019-11-22','2019-02-19',
+  '2020-12-25','2020-01-01','2020-01-15','2020-02-19','2020-05-28','2020-07-04','2020-09-03','2020-10-08','2020-11-12','2020-11-22','2020-02-19',
+  '2021-12-25','2021-01-01','2021-01-15','2021-02-19','2021-05-28','2021-07-04','2021-09-03','2021-10-08','2021-11-12','2021-11-22','2021-02-19',
+  '2022-12-25','2022-01-01','2022-01-15','2022-02-19','2022-05-28','2022-07-04','2022-09-03','2022-10-08','2022-11-12','2022-11-22','2022-02-19',
+  '2023-12-25','2023-01-01','2023-01-15','2023-02-19','2023-05-28','2023-07-04','2023-09-03','2023-10-08','2023-11-12','2023-11-22','2023-02-19'))
+)
+
+special_holidays = accidents_tsbl %>%
+as_tibble() %>%
+filter(accidents_log>1250) %>%
+select(-accidents_log) %>%
+mutate(holiday = paste('holiday',row_number()))
+
+final_holidays = holidays %>%
+bind_rows(special_holidays) %>%
+distinct(Date,.keep_all=T) %>%
+as_tsibble(index=Date)
+
+final_holidays
+```
+
+Let's perform time-series decomposition on our final model once again after including the holidays.
+
+```{r}
+model = train %>%
+    model(
+      prophet_orig = fable.prophet::prophet(accidents_log),
+      prophet_w_holidays = fable.prophet::prophet(accidents_log~growth(type="linear",changepoint_range=0.9,capacity=750,floor=0)+season(period='week',type='additive')+holiday(final_holidays)))
+
+model %>%
+components() %>%
+autoplot()
+```
+
+```{r}
+model %>%
+forecast(h=365) %>%
+autoplot(accidents_tsbl,level=NULL)+
+xlim(ymd('2023-01-01'),ymd('2023-12-31'))+labs(title = 'Comparison of models with and without holidays')
+```
+
+Upon observing the above plots, we can see that the prophet model with holidays included performs better than the original Prophet model.
+
+## Section 4 - Model Selection and Comparison
+
+#### Model comparison - ARIMA, SNAIVE and Prophet Model
+
+To compare models, let's fit our best ARIMA and snaive model, prophet model to each fold in the cross-validation scheme. For further analysis, we shall visualize and validate which model performs better.
+
+```{r}
+accidents_cv = train %>%
+stretch_tsibble(.init=30,.step=30)
+
+accidents_cv %>%
+    ggplot()+
+    geom_point(aes(date,factor(.id),color=factor(.id)))+
+    ylab('Iteration')+
+    ggtitle('Samples included in each CV Iteration')
+```
+
+#### Cross Validation
+
+Let's test each model for cross-validation forecast for each iteration and compare. Here, several combinations have been tested, including linear or logistic and changepoint_range. Here, holidays have also been included.
+
+```{r,warning=FALSE}
+accidents_cv_forecast <- accidents_cv %>%
+  model(
+    naive = SNAIVE(accidents_log~lag('week')),
+    
+    arima = ARIMA(accidents_log ~ pdq(0,1,2)+ PDQ(0,0,0)),
+
+  prophet_logistic_50 = fable.prophet::prophet(accidents_log~growth(type="logistic",n_changepoints=50,capacity=750,floor=0)+season(period='week',type='additive')+holiday(final_holidays)),
+    
+  
+  prophet_linear_0.9= fable.prophet::prophet(accidents_log~growth(type= "linear",changepoint_range=0.9,capacity=750,floor=0)+season(period='week',type='additive')+holiday(final_holidays)),
+  
+                                    
+  ) %>%
+  forecast(h = 30)
+
+
+accidents_cv_forecast %>%
+  autoplot(accidents_cv) + 
+  facet_wrap(~.id,ncol=2, scales = 'free_y') + 
+  theme_bw() +
+  ylab('Number of Crashes') + ggtitle("Cross validation forecast comparison for each iteration") +  # Using month abbreviations as labels
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylim(3,5)
+
+```
+
+```{r}
+accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-accidents_log) %>%
+  left_join(
+      accidents_tsbl
+  ) %>%
+  
+    ggplot()+
+    geom_line(aes(date,accidents_log))+
+    geom_line(aes(date,.mean,color=factor(.id),linetype=.model))+
+    scale_color_discrete(name='Iteration')+
+    ylab('CPD Crashes')+ ggtitle("Cross validation forecast comparison for each model")
+```
+
+```{r}
+accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-accidents_log) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id,.model) %>%
+  mutate(
+    days_ahead = seq(1:30)
+  ) %>%
+  ungroup() %>%
+  filter(days_ahead<=30) %>%
+  mutate(error = abs(accidents_log - .mean)) %>%
+  ggplot()+
+  geom_boxplot(aes(factor(days_ahead),error))+
+  facet_wrap(~.model,ncol=1)+
+  guides(color='none')+
+  ylab('Absolute Error')+
+  xlab('Days Ahead')+
+  ggtitle('Absolute Error by Iteration')+
+  ylim(0,1)
+```
+
+#### Comparison of models using RMSE, MAPE and MAE
+
+```{r}
+rmse = accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-accidents_log) %>%
+  left_join(accidents_tsbl) %>% 
+  group_by(.id,.model) %>%
+  mutate(
+    weeks_ahead = seq(1:30)
+  ) %>%
+  ungroup() %>% 
+  filter(!is.na(accidents_log)) %>%
+  group_by(weeks_ahead,.model) %>%
+  summarize(
+    rmse = sqrt(mean((accidents_log - .mean)^2,na.rm=T)),
+  ) %>%
+  ungroup() %>%
+  filter(.model != "prophet_logistic_50") %>%
+  ggplot()+
+  geom_line(aes(weeks_ahead,rmse,color=.model))+
+  xlab("Weeks Ahead")+
+  ylab("RMSE")
+
+mape = accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-accidents_log) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id,.model) %>%
+  mutate(
+    weeks_ahead = seq(1:30)
+  ) %>%
+  ungroup() %>%
+  group_by(weeks_ahead,.model) %>%
+  mutate(
+    mape = mean(abs((accidents_log - .mean)/accidents_log),na.rm=T)
+  ) %>%
+  ungroup() %>%
+  filter(.model != "prophet_logistic_50") %>%
+  ggplot()+
+  geom_line(aes(weeks_ahead,mape,color=.model))+
+  xlab("Weeks Ahead")+
+  ylab("MAPE")
+
+mae = accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-accidents_log) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id, .model) %>%
+  mutate(weeks_ahead = seq(1:30)) %>%
+  ungroup() %>%
+  group_by(weeks_ahead, .model) %>%
+  mutate(mae = mean(abs(accidents_log - .mean), na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(.model != "prophet_logistic_50") %>%
+  ggplot() +
+  geom_line(aes(weeks_ahead, mae, color = .model)) +
+  xlab("Weeks Ahead") +
+  ylab("MAE")
+
+rmse+mape+mae+plot_layout(ncol = 2, byrow = TRUE) + plot_annotation(title = "Comparison of RMSE, MAPE and MAE plots")
+```
+
+
+```{r}
+accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-accidents_log) %>%
+  left_join(accidents_tsbl) %>% 
+  group_by(.id,.model) %>%
+  mutate(
+    days_ahead = seq(1:30)
+  ) %>%
+  ungroup() %>% 
+  filter(!is.na(accidents_log)) %>%
+  group_by(days_ahead,.model) %>%
+  summarize(
+    rmse = sqrt(mean((accidents_log - .mean)^2,na.rm=T)),
+  ) %>%
+  ungroup() %>%
+  ggplot()+
+  geom_point(aes(days_ahead,rmse,color=.model),alpha=0.4)+ 
+  geom_smooth(aes(days_ahead,rmse,color=.model),se=F)+
+  xlab("Days Ahead")+
+  ylab("Smoothed RMSE")+
+  ylim(0,0.75) +
+  labs(title = 'RMSE plot for all models')
+```
+
+```{r}
+accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-accidents_log) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id,.model) %>%
+  mutate(
+    days_ahead = seq(1:30)
+  ) %>%
+  ungroup() %>%
+  group_by(days_ahead,.model) %>%
+  mutate(
+    mape = mean(abs((accidents_log - .mean)/accidents_log),na.rm=T)
+  ) %>%
+  ungroup() %>%
+  ggplot()+
+  geom_point(aes(days_ahead,mape,color=.model),alpha=0.4)+ 
+  geom_smooth(aes(days_ahead,mape,color=.model),se=F)+
+  xlab("Weeks Ahead")+
+  ylab("Smoothed MAPE")+
+  labs(title = 'MAPE plot for all models')
+```
+
+Based on the above RMSE, MAPE plots, we can clearly see that our ARIMA model performs the best. We can also observe that our prophet model performs slightly better than a seasonal naive model. Now, let's fit our best selected model on the test set and discuss the performance results.
+
+#### Fitting final model and forecasting
+
+```{r,warning=FALSE}
+
+best_model_arima %>%
+ forecast(h=74) %>%
+ autoplot(
+ train %>%
+ as_tsibble() %>%
+ select(date,cpd_crashes) %>%
+ bind_rows(
+ test %>%
+ as_tsibble() %>%
+ select(date,cpd_crashes)
+ )) +
+ geom_vline(aes(xintercept = ymd("2023-12-01")), color = "red", linetype = "dashed") +
+ ggtitle(" Forecast vs Actual of CPD crashes", subtitle = 'ARIMA Forecast for Seasonal data (on test set)')
+```
+
+```{r}
+best_model_arima %>%
+    forecast(h=73) %>%
+    accuracy(test)
+```
+
+Now, let's fit the best model to entire data and produce a forecast for a meaningful period of time.
+
+```{r}
+
+accidents_tsbl %>%
+  model(
+    ARIMA(log(cpd_crashes) ~ pdq(0,1,2),approximation=F)) %>%
+    
+  forecast(h=30) %>%
+  autoplot(
+    accidents_tsbl %>%
+    filter(date>=ymd('2023-09-01'))
+  )+
+  theme_bw() + ggtitle("30 day forecast of CPD crashes")
+```
+The forecast has been done for 30 days, and we can see that it is not a very good representation of our data. The forecast tends to constant behaviour, thus maintaining constant variance as expected. However, the model can better include the various fluctuations that are caused in that data. Perhaps, taking into account historical data of at least 3 years would give us better modelling parameters and forecast. 
+
+::: 
