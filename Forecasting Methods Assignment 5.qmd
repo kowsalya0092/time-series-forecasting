@@ -1,0 +1,549 @@
+---
+title: "Forecasting Methods Assignment 5"
+author: "Kowsalya Muralidharan"
+format: 
+  html:
+    fig-align: center # Center figure alignment
+    embed-resources: true # Force document to be self-contained (critical!)
+    code-fold: true # Turn on code fold
+self-contained: TRUE
+editor: visual
+embed-resources: true
+execute: 
+  warning: false # Turn off warnings
+theme: "pulse"
+toc: true
+---
+
+## **Section 1 - Fitting a Meta Prophet Model**
+
+In this section, we shall implement a Prophet model to forecast Cincinnati Traffic Accidents, focusing on daily data. Since our analysis is conducted at a daily level, we will consider holidays in our models. The Prophet model comprises three main components: trend, seasonality, and holidays. It efficiently captures positive and negative changes in the trend using a piece-wise growth curve, addresses seasonal effects occurring daily, weekly, or yearly, and accounts for special events that might influence the time series. Let's fit an initial Prophet model and generate a 14-day forecast for our data.
+
+```{r}
+#| warning: false
+library(slider)
+library(lubridate)
+library(tsibble)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(tidyr)
+library(patchwork)
+library(lubridate)
+library(knitr)
+library(fpp3)
+library(psych)
+library(forecast)
+library(urca)
+library(data.table)
+library(fable)
+#install.packages("fable.prophet")
+library(fable.prophet)
+library(changepoint)
+#install.packages("changepoint")
+```
+
+```{r}
+accidents <- read.csv("C:\\Users\\kowsa\\Downloads\\cpd_crashes.csv")
+
+
+accidents$date <- ymd(accidents$date)
+
+accidents_tsbl<- accidents %>%
+as_tsibble(index=date) %>%
+mutate(date = ymd(accidents$date))
+
+accidents_tsbl
+
+```
+
+```{r}
+accidents_tsbl %>% 
+  ggplot()+
+  geom_line(aes(date,cpd_crashes))+
+  theme_bw()+
+  labs(title = 'Daily Cincinnati Traffic Crashes -2023')+
+  ylim(0,150)
+
+```
+
+Let's split our data into training and test data set for further analysis. Here, 80% of that data has been used for training and the rest for testing purposes.
+
+```{r}
+accidents_tsbl %>%
+    ggplot()+
+    geom_line(aes(date,cpd_crashes))+
+    labs(title = 'Split train and test data')+
+    geom_vline(aes(xintercept=ymd('2023-10-19')),color='red')+
+    theme_bw()
+
+train <- accidents_tsbl %>%  
+  filter(date<ymd('2023-10-19'))
+
+# Test set
+test <- accidents_tsbl %>% 
+  filter(date>=ymd('2023-10-19'))
+
+
+```
+
+```{r}
+
+train %>%
+model(prophet = fable.prophet::prophet(cpd_crashes)) %>%
+forecast(h=74) %>%
+autoplot(accidents_tsbl)
+
+
+```
+
+By looking at this forecast, we can see that it does not accurately capture the trend.
+
+## **Section 2 - Time-series Decomposition, Saturation and Trend**
+
+For further analysis, let's perform time-series decomposition on our model.
+
+```{r}
+model = train %>%
+    model(prophet = fable.prophet::prophet(cpd_crashes))
+
+model %>%
+components() %>%
+autoplot()
+```
+
+To detect critical changepoints in our time-series trend, we will first plot automated changepoint detection.
+
+```{r}
+changepoints = model %>%
+glance() %>%
+pull(changepoints) %>%
+bind_rows() %>%
+.$changepoints
+
+train %>%
+ggplot()+
+geom_line(aes(date,cpd_crashes))+
+# geom_vline(aes(xintercept=ymd('2000-01-01')))
+geom_vline(xintercept=as.Date(changepoints),color='red',linetype='dashed')+
+  labs(title = 'Automatic changepoints')
+```
+
+-   This seems to accurately follow our trend line, but let's modify some parameters to fine-tune the changepoints parameter. Here, several combinations of changepoints have been tested.
+
+-   Based on the information we have for now, let's set the growth type for our time-series data as 'linear'.
+
+```{r}
+# Number of Changepoints
+
+model = train %>%
+    model(
+        prophet_orig = fable.prophet::prophet(cpd_crashes~growth(type= "linear")+season(period='week')+season(period='day')),
+        
+        prophet_5 = fable.prophet::prophet(cpd_crashes~growth(type="linear",n_changepoints=5)+season(period='week')+season(period='day')),
+        
+prophet_90_range = fable.prophet::prophet(cpd_crashes~growth(changepoint_range=0.9)+season(period='week')+season(period='day'))
+)
+
+changepoints_orig = model %>%
+glance() %>%
+filter(.model == 'prophet_orig') %>%
+pull(changepoints) %>%
+bind_rows() %>%
+filter(abs(adjustment)>0.01) %>%
+.$changepoints
+
+prophet_5 = model %>%
+glance() %>%
+filter(.model == 'prophet_5') %>%
+unnest(changepoints) %>%
+bind_rows() %>%
+filter(abs(adjustment)>=0.01) %>%
+.$changepoints
+
+changepoints_90_range = model %>%
+glance() %>%
+filter(.model == 'prophet_90_range') %>%
+unnest(changepoints) %>%
+bind_rows() %>%
+filter(abs(adjustment)>=0.01) %>%
+.$changepoints
+
+model %>%
+forecast(h=30) %>%
+autoplot(train,level=NULL)+
+geom_vline(xintercept=as.Date(changepoints_orig),color='blue',linetype='dashed')+
+geom_vline(xintercept=as.Date(changepoints_90_range),color='red',linetype='dashed') +
+geom_vline(xintercept=as.Date(prophet_5),color='darkgreen',linetype='dashed') +
+  labs(title = 'Changepoints comparison')
+```
+
+It is intuitive that number of crashes cannot be negative. Therefore, it can be said with certainty that our floor value has to be '0'. However, to determine the cap value, we need to look at the highest number of crashes throughout the year and intuitively decide on the value. Here, the capacity has been set to 750 and floor to 0.
+
+```{r}
+train %>%
+    model(
+        prophet_orig = fable.prophet::prophet(cpd_crashes),
+        prophet_saturating = fable.prophet::prophet(cpd_crashes~growth(type='linear',capacity=750,floor=0,changepoint_range=0.9)+season('week'))
+        ) %>%
+    components() %>%
+
+    autoplot(trend)
+```
+
+Based on the trend, we can also conclude that it makes more sense to reduce the number of changepoints to changepoint_range=0.9.
+
+## **Section 3**
+
+Based on the Prophet decomposition plot, we see that there is some weekly seasonality. Let's further analyse to identify the seasonal properties of our data.
+
+```{r}
+model = train %>%
+    model(prophet = fable.prophet::prophet(cpd_crashes))
+
+model %>%
+components() 
+```
+
+```{r}
+weekly_seasonality = model %>%
+components() %>%
+as_tibble() %>%
+mutate(wday = lubridate::wday(date,label = TRUE,abbr=T)) %>%
+group_by(wday) %>%
+summarize(weekly = mean(weekly,na.rm=T)) %>%
+ungroup() %>%
+ggplot()+
+geom_line(aes(wday,weekly,group=1))
+
+yearly_seasonality = model %>%
+components() %>%
+autoplot(yearly)
+
+yearly_seasonality / weekly_seasonality
+```
+
+Based on the peaks and troughs in the above plot, we see that our data has some seasonality associated with it.
+
+```{r}
+model = train %>%
+    model(
+      additive = fable.prophet::prophet(cpd_crashes~growth(type="linear",changepoint_range=0.9,capacity=750,floor=0)+season(period='week',type='additive')+season(period='day')),
+      multiplicative = fable.prophet::prophet(cpd_crashes~growth(type="linear",changepoint_range=0.9,capacity=750,floor=0)+season(period='week',type='multiplicative')+season(period='day')))
+
+model %>%
+components() %>%
+autoplot()
+```
+
+Looking at the additive seasonality plot, it seems that seasonality is present in general because some months are clearly higher and lower than others within a year. Time series having multiplicative seasonality usually has differently sized peaks and troughs. Based on the above plots, we can conclude that our model has additive seasonality.
+
+```{r}
+model %>%
+forecast(h=14) %>%
+autoplot(level=NULL)
+```
+
+Since we are dealing with daily data, it makes sense to consider the holidays in our dataset.
+
+```{r}
+holidays = tibble(
+  holiday = c('Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday',
+  'Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday',
+  'Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday',
+  'Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday',
+  'Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday',
+  'Christmas Day','New Year\'s Day','Martin Luther King Jr. Day','Presidents\' Day','Memorial Day','Independence Day','Labor Day','Columbus Day','Veterans Day','Thanksgiving','Washington\'s Birthday'),
+  Date = ymd(c(
+  '2018-12-25','2018-01-01','2018-01-15','2018-02-19','2018-05-28','2018-07-04','2018-09-03','2018-10-08','2018-11-12','2018-11-22','2018-02-19',
+  '2019-12-25','2019-01-01','2019-01-15','2019-02-19','2019-05-28','2019-07-04','2019-09-03','2019-10-08','2019-11-12','2019-11-22','2019-02-19',
+  '2020-12-25','2020-01-01','2020-01-15','2020-02-19','2020-05-28','2020-07-04','2020-09-03','2020-10-08','2020-11-12','2020-11-22','2020-02-19',
+  '2021-12-25','2021-01-01','2021-01-15','2021-02-19','2021-05-28','2021-07-04','2021-09-03','2021-10-08','2021-11-12','2021-11-22','2021-02-19',
+  '2022-12-25','2022-01-01','2022-01-15','2022-02-19','2022-05-28','2022-07-04','2022-09-03','2022-10-08','2022-11-12','2022-11-22','2022-02-19',
+  '2023-12-25','2023-01-01','2023-01-15','2023-02-19','2023-05-28','2023-07-04','2023-09-03','2023-10-08','2023-11-12','2023-11-22','2023-02-19'))
+)
+
+special_holidays = accidents_tsbl %>%
+as_tibble() %>%
+filter(cpd_crashes>1250) %>%
+select(-cpd_crashes) %>%
+mutate(holiday = paste('holiday',row_number()))
+
+final_holidays = holidays %>%
+bind_rows(special_holidays) %>%
+distinct(Date,.keep_all=T) %>%
+as_tsibble(index=Date)
+
+final_holidays
+```
+
+Let's perform time-series decomposition on our final model once again after including the holidays.
+
+```{r}
+model = train %>%
+    model(
+      prophet_orig = fable.prophet::prophet(cpd_crashes),
+      prophet_w_holidays = fable.prophet::prophet(cpd_crashes~growth(type="linear",changepoint_range=0.9,capacity=750,floor=0)+season(period='week',type='additive')+season(period='day')+holiday(final_holidays)))
+
+model %>%
+components() %>%
+autoplot()
+```
+
+```{r}
+model %>%
+forecast(h=365) %>%
+autoplot(accidents_tsbl,level=NULL)+
+xlim(ymd('2023-01-01'),ymd('2023-12-31'))+labs(title = 'Comparison of models with and without holidays')
+```
+
+## **Section 4 - Model Validation**
+
+Let's perform model validation and conduct rolling window cross-validation to assess performance of the model at meaningful thresholds. Then let's perform cross-validation for each iteration.
+
+Finally, assess the performance of the best-performing model on the test set. How does the model perform? Does it seem to overfit the training data? If so, how might you adjust the model to improve performance?
+
+```{r}
+accidents_tsbl %>%
+ggplot()+
+geom_vline(xintercept = ymd("2023-10-19"),linetype='dashed',color='red')+
+geom_line(aes(date,cpd_crashes)) +
+  labs(title = 'Test and train data')
+```
+
+```{r}
+accidents_cv = train %>%
+stretch_tsibble(.init=30,.step=30)
+
+accidents_cv %>%
+    ggplot()+
+    geom_point(aes(date,factor(.id),color=factor(.id)))+
+    ylab('Iteration')+
+    ggtitle('Samples included in each CV Iteration')
+```
+
+Let's test each model for cross-validation forecast for each iteration and compare. Here, several combinations have been tested, including linear or logistic and changepoint_range. Here, holidays have also been included.
+
+```{r}
+accidents_cv_forecast <- accidents_cv %>%
+  model(
+    naive = SNAIVE(cpd_crashes~lag('week')),
+    
+    arima = ARIMA(cpd_crashes ~ pdq(1,0,0)+PDQ(1,0,0)),
+
+
+    prophet_linear_0.9 = fable.prophet::prophet(cpd_crashes~growth(type="linear",changepoint_range=0.9,capacity=750,floor=0)+season(period='week',type='additive')+season(period='day')+holiday(final_holidays)),
+
+   prophet_logistic_50 = fable.prophet::prophet(cpd_crashes~growth(type="logistic",n_changepoints=50,capacity=750,floor=0)+season(period='week',type='additive')+season(period='day')+holiday(final_holidays)),
+
+  prophet_linear_25 = fable.prophet::prophet(cpd_crashes~growth(type="linear",n_changepoints=25,capacity=750,floor=0)+season(period='week',type='additive')+season(period='day')+holiday(final_holidays)),
+    
+  prophet_= fable.prophet::prophet(cpd_crashes~growth(type= "logistic",changepoint_range=0.4,capacity=100,floor=0)+season(period=NULL,type='additive')+holiday(final_holidays)),
+  
+  prophet_= fable.prophet::prophet(cpd_crashes~growth(type= "linear",changepoint_range=0.9,capacity=100,floor=0)+season(period=NULL,type='additive')+holiday(final_holidays)),
+  
+                                    
+  ) %>%
+  forecast(h = 14)
+
+
+accidents_cv_forecast %>%
+  autoplot(accidents_cv) + 
+  facet_wrap(~.id,nrow=4, scales = 'free_y') + 
+  theme_bw() +
+  ylab('Number of Crashes') + ggtitle("Cross validation forecast comparison for each iteration") +  # Using month abbreviations as labels
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+```{r}
+accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(
+      accidents_tsbl
+  ) %>%
+    ggplot()+
+    geom_line(aes(date,cpd_crashes))+
+    geom_line(aes(date,.mean,color=factor(.id),linetype=.model))+
+    scale_color_discrete(name='Iteration')+
+    ylab('CPD Crashes')+ ggtitle("Cross validation forecast comparison for each model")
+```
+
+```{r}
+accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id,.model) %>%
+  mutate(
+    days_ahead = seq(1:14)
+  ) %>%
+  ungroup() %>%
+  filter(days_ahead<=14) %>%
+  mutate(error = abs(cpd_crashes - .mean)) %>%
+  ggplot()+
+  geom_boxplot(aes(factor(days_ahead),error))+
+  facet_wrap(~.model,ncol=1)+
+  guides(color='none')+
+  ylab('Absolute Error')+
+  xlab('Days Ahead')+
+  ggtitle('Absolute Error by Iteration')+
+  ylim(0,75)
+```
+
+```{r}
+rmse = accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(accidents_tsbl) %>% 
+  group_by(.id,.model) %>%
+  mutate(
+    weeks_ahead = seq(1:14)
+  ) %>%
+  ungroup() %>% 
+  filter(!is.na(cpd_crashes)) %>%
+  group_by(weeks_ahead,.model) %>%
+  summarize(
+    rmse = sqrt(mean((cpd_crashes - .mean)^2,na.rm=T)),
+  ) %>%
+  ungroup() %>%
+  ggplot()+
+  geom_line(aes(weeks_ahead,rmse,color=.model))+
+  xlab("Weeks Ahead")+
+  ylab("RMSE")
+
+mape = accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id,.model) %>%
+  mutate(
+    weeks_ahead = seq(1:14)
+  ) %>%
+  ungroup() %>%
+  group_by(weeks_ahead,.model) %>%
+  mutate(
+    mape = mean(abs((cpd_crashes - .mean)/cpd_crashes),na.rm=T)
+  ) %>%
+  ungroup() %>%
+  ggplot()+
+  geom_line(aes(weeks_ahead,mape,color=.model))+
+  xlab("Weeks Ahead")+
+  ylab("MAPE")
+
+mae = accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id, .model) %>%
+  mutate(weeks_ahead = seq(1:14)) %>%
+  ungroup() %>%
+  group_by(weeks_ahead, .model) %>%
+  mutate(mae = mean(abs(cpd_crashes - .mean), na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot() +
+  geom_line(aes(weeks_ahead, mae, color = .model)) +
+  xlab("Weeks Ahead") +
+  ylab("MAE")
+
+rmse+mape+mae+plot_layout(ncol = 2, byrow = TRUE) + plot_annotation(title = "Comparison of RMSE, MAPE and MAE plots")
+```
+
+```{r}
+accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(accidents_tsbl) %>% 
+  group_by(.id,.model) %>%
+  mutate(
+    days_ahead = seq(1:14)
+  ) %>%
+  ungroup() %>% 
+  filter(!is.na(cpd_crashes)) %>%
+  group_by(days_ahead,.model) %>%
+  summarize(
+    rmse = sqrt(mean((cpd_crashes - .mean)^2,na.rm=T)),
+  ) %>%
+  ungroup() %>%
+  ggplot()+
+  geom_point(aes(days_ahead,rmse,color=.model),alpha=0.4)+ 
+  geom_smooth(aes(days_ahead,rmse,color=.model),se=F)+
+  xlab("Days Ahead")+
+  ylab("Smoothed RMSE")+
+  ylim(0,100) +
+  labs(title = 'RMSE plot for all models')
+```
+
+```{r}
+accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id,.model) %>%
+  mutate(
+    days_ahead = seq(1:14)
+  ) %>%
+  ungroup() %>%
+  group_by(days_ahead,.model) %>%
+  mutate(
+    mape = mean(abs((cpd_crashes - .mean)/cpd_crashes),na.rm=T)
+  ) %>%
+  ungroup() %>%
+  ggplot()+
+  geom_point(aes(days_ahead,mape,color=.model),alpha=0.4)+ 
+  geom_smooth(aes(days_ahead,mape,color=.model),se=F)+
+  xlab("Weeks Ahead")+
+  ylab("Smoothed MAPE")+
+  labs(title = 'MAPE plot for all models')
+```
+
+```{r}
+accidents_cv_forecast %>%
+  accuracy(accidents_tsbl)
+```
+
+Now let's fit the test data to our best model (ARIMA) as well as prophet model and evaluate its performance.
+
+```{r}
+
+final_prophet <- train %>%
+ as_tsibble() %>%
+ model(fable.prophet::prophet(cpd_crashes~growth(type= "linear",changepoint_range=0.9,capacity=100,floor=0)+season(period=NULL,type='additive')+holiday(final_holidays)))
+
+final_model <- train %>%
+ as_tsibble() %>%
+ model(ARIMA(cpd_crashes ~ pdq(1,0,0) + PDQ(1,0,0)))
+  
+final_model %>%
+    forecast(h=14) %>%
+    autoplot(train %>%
+    bind_rows(test))+
+    ylab('Cincinnati Crashes Count')+
+    theme_bw()
+```
+
+```{r}
+final_prophet %>%
+    forecast(h=14) %>%
+    autoplot(train %>%
+    bind_rows(test))+
+    ylab('Cincinnati Crashes Count')+
+    theme_bw() +
+  labs(title = 'Plotting on test data')
+```
+
+```{r}
+final_model %>%
+    forecast(h=73) %>%
+    accuracy(test)
+```
+
+```{r}
+final_prophet %>%
+    forecast(h=73) %>%
+    accuracy(test)
+```
+
+Based on the MAPE, RMSE and other metrics, we can see that our ARIMA model performs the best. Ideally, Prophet models are supposed to be the best model for daily data. However, in our case ARIMA model performs better on training data. However, we can see that on the test data the Prophet model shows lesser RMSE. In my opinion, the model is underfitting the data.

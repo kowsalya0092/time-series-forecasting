@@ -1,0 +1,277 @@
+---
+title: "Forecasting Methods Assignment 4"
+author: "Kowsalya Muralidharan"
+format: 
+  html:
+    fig-align: center # Center figure alignment
+    embed-resources: true # Force document to be self-contained (critical!)
+    code-fold: true # Turn on code fold
+self-contained: TRUE
+editor: visual
+embed-resources: true
+execute: 
+  warning: false # Turn off warnings
+theme: "pulse"
+---
+
+## **Section 1 - Train and Test Splits**
+
+Approximately 80% of the dataset has been used for training and the remaining is used for testing the model. From the below plot, we can see that the test set is a good representation of our training set.
+
+```{r}
+#| warning: false
+library(slider)
+library(lubridate)
+library(tsibble)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(tidyr)
+library(patchwork)
+library(lubridate)
+library(knitr)
+library(fpp3)
+library(psych)
+library(forecast)
+library(urca)
+library(data.table)
+```
+
+```{r}
+accidents <- read.csv("C:\\Users\\kowsa\\Downloads\\cpd_crashes.csv")
+
+
+accidents$date <- ymd(accidents$date)
+
+accidents_tsbl<- accidents %>%
+as_tsibble(index=date) %>%
+mutate(date = ymd(accidents$date))
+
+accidents_tsbl
+
+```
+
+```{r}
+split_date <- as.Date("2023-01-01") + floor(0.8 * nrow(accidents_tsbl))
+train_data <- accidents_tsbl %>% filter(date < split_date)
+test_data <- accidents_tsbl %>% filter(date >= split_date)
+
+ggplot(train_data, aes(x = date, y = cpd_crashes)) +
+  geom_line(data = train_data, aes(x = date, y = cpd_crashes), color = "blue", linetype = "solid",size=0.5) +
+  geom_line(data = test_data, color = 'red') +
+  geom_vline(xintercept = split_date, color = 'darkgreen', linetype = "dashed") +
+  theme_bw() +
+  ylab('Number of Crashes') +
+  ggtitle('Training and Test Data')
+```
+
+## **Section 2 - Cross-Validation Scheme**
+
+Next, we set up a rolling window cross-validation scheme using `stretch_tsibble.` The initial training period and step have been set at 30 to group the samples on a monthly basis.
+
+```{r}
+accidents_cv = accidents_tsbl %>%
+  stretch_tsibble(.init = 30, .step = 30)
+
+accidents_cv
+```
+
+```{r}
+accidents_cv %>%
+    ggplot()+
+    geom_point(aes(date,factor(.id),color=factor(.id)))+
+    ylab('Iteration')+
+    ggtitle('Samples included in each CV Iteration')
+```
+
+Based on our initial and step value, we have 12 iterations in our cross-validation scheme.
+
+## **Section 3 - Model Selection and Comparison**
+
+To compare models, let's fit ARIMA and naive model to each fold in the cross-validation scheme. For further analysis, we shall visualize and validate which model performs better.
+
+```{r}
+accidents_cv %>%
+  model(
+    arima = ARIMA(cpd_crashes~pdq(1,0,0)+PDQ(0,0,0)),
+    naive = NAIVE(cpd_crashes)
+  )
+```
+
+```{r}
+accidents_cv_forecast <- accidents_cv %>%
+  model(
+    naive = NAIVE(cpd_crashes),
+    arima = ARIMA(cpd_crashes ~ pdq(1,0,0)),
+    naive_w_drift = NAIVE(cpd_crashes~drift())
+  ) %>%
+  forecast(h = 14)
+
+
+accidents_cv_forecast %>%
+  autoplot(accidents_cv) + 
+  facet_wrap(~.id,nrow=4, scales = 'free_y') + 
+  theme_bw() +
+  ylab('Number of Crashes') + ggtitle("Cross validation forecast comparison for each iteration") +  # Using month abbreviations as labels
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(
+      accidents_tsbl
+  ) %>%
+    ggplot()+
+    geom_line(aes(date,cpd_crashes))+
+    geom_line(aes(date,.mean,color=factor(.id),linetype=.model))+
+    scale_color_discrete(name='Iteration')+
+    ylab('CPD Crashes')+ ggtitle("Cross validation forecast comparison for each model")
+  
+```
+
+When we combine the 12 iterations of each model, we can see that NAIVE performs poorly and ARIMA performs the best among the three models. It follows the underlying trend of our training data more closely.
+
+To further compare the performance of the two models, we will use the RMSE, MAE, MAPE and MASE.
+
+```{r}
+accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id,.model) %>%
+  mutate(
+    weeks_ahead = seq(1:14)
+  ) %>%
+  ungroup() %>%
+  mutate(error = abs(cpd_crashes - .mean)) %>%
+  ggplot()+
+  geom_boxplot(aes(factor(weeks_ahead),error))+
+  geom_point(aes(factor(weeks_ahead),error,color=factor(.id)),alpha=0.4)+
+  facet_wrap(~.model,ncol=1)+
+  guides(color='none')+
+  ylab('Absolute Error')+
+  xlab('Weeks Ahead')+
+  ggtitle('Absolute Error by Iteration, ARIMA , NAIVE & NAIVE with Drift')
+```
+
+From the above plot, once again we see that ARIMA model performs the best based on the absolute error values.
+
+```{r}
+rmse = accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(accidents_tsbl) %>% 
+  group_by(.id,.model) %>%
+  mutate(
+    weeks_ahead = seq(1:14)
+  ) %>%
+  ungroup() %>% 
+  filter(!is.na(cpd_crashes)) %>%
+  group_by(weeks_ahead,.model) %>%
+  summarize(
+    rmse = sqrt(mean((cpd_crashes - .mean)^2,na.rm=T)),
+  ) %>%
+  ungroup() %>%
+  ggplot()+
+  geom_line(aes(weeks_ahead,rmse,color=.model))+
+  xlab("Weeks Ahead")+
+  ylab("RMSE")
+
+mape = accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id,.model) %>%
+  mutate(
+    weeks_ahead = seq(1:14)
+  ) %>%
+  ungroup() %>%
+  group_by(weeks_ahead,.model) %>%
+  mutate(
+    mape = mean(abs((cpd_crashes - .mean)/cpd_crashes),na.rm=T)
+  ) %>%
+  ungroup() %>%
+  ggplot()+
+  geom_line(aes(weeks_ahead,mape,color=.model))+
+  xlab("Weeks Ahead")+
+  ylab("MAPE")
+
+mae = accidents_cv_forecast %>%
+  as_tibble() %>%
+  select(-cpd_crashes) %>%
+  left_join(accidents_tsbl) %>%
+  group_by(.id, .model) %>%
+  mutate(weeks_ahead = seq(1:14)) %>%
+  ungroup() %>%
+  group_by(weeks_ahead, .model) %>%
+  mutate(mae = mean(abs(cpd_crashes - .mean), na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot() +
+  geom_line(aes(weeks_ahead, mae, color = .model)) +
+  xlab("Weeks Ahead") +
+  ylab("MAE")
+
+rmse+mape+mae+plot_layout(ncol = 2, byrow = TRUE) + plot_annotation(title = "Comparison of RMSE, MAPE and MAE plots")
+
+```
+
+-   From the above plots, we can observe that naive and naive with drift models perform close to each other.
+
+-   Although the naive models show more stability over time, we can clearly see that ARIMA has the least error and hence exhibits better performance.
+
+Based on full error metrics, we see that the RMSE value of our ARIMA model is 20.50, whereas that of NAIVE and NAIVE with drift are 32.43 and 33.25 respectively.
+
+```{r}
+accidents_cv_forecast %>%
+  accuracy(accidents_tsbl)%>%
+  data.table()
+```
+
+Here, we compare the ME, RMSE, MAE, MPE, MAPE, MASE value for each model and for each iteration of our validation scheme.
+
+```{r}
+accidents_cv_forecast %>%
+filter(.id<5) %>%
+group_by(.id) %>%
+  accuracy(accidents_tsbl) %>%
+  ungroup() %>%
+  arrange(.id)
+```
+
+## **Section 4 - Final Forecast**
+
+Now that we have concluded that the ARIMA model is the best, let's refit the model to the entire training set and produce a forecast for the test set. The goal is to compare the performance to the "out-of-sample" actual observed values.
+
+```{r}
+best_model1 = train_data %>%
+ as_tsibble() %>%
+ model(ARIMA(cpd_crashes ~ pdq(1,0,0) + PDQ(0,0,0)))
+
+best_model1 %>%
+ forecast(h=73) %>%
+ autoplot(
+ train_data %>%
+ as_tsibble() %>%
+ select(date,cpd_crashes) %>%
+ bind_rows(
+ test_data %>%
+ as_tsibble() %>%
+ select(date,cpd_crashes)
+ )) +
+ geom_vline(aes(xintercept = ymd("2023-12-01")), color = "red", linetype = "dashed") +
+ ggtitle(" Forecast vs Actual of CPD crashes", subtitle = 'ARIMA Forecast for Non-Seasonal data')
+```
+
+```{r}
+best_model1 %>%
+    forecast(h=73) %>%
+    accuracy(test_data)
+```
+
+-   The above plot shows the final forecast on the test data (January 2023- December 2023) based on the best model (*ARIMA(1,0,0)(0,0,0)*) selected basis the cross validation analysis.
+
+-   Upon visualization we see a straight line in the forecast, which was unexpected. It can be observed that the model does not seem to be producing a reasonable forecast and it is under-fitting our data.
+
+-   The RMSE of our final model is 25.76, which is slightly higher than ideal.

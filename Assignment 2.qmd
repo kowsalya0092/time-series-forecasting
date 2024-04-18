@@ -1,0 +1,517 @@
+---
+title: "Forecasting Methods Assignment 2"
+author: "Kowsalya Muralidharan"
+format: html
+self-contained: TRUE
+code_folding: hide
+editor: visual
+embed-resources: true
+---
+
+```{r}
+#| warning: false
+library(slider)
+library(lubridate)
+library(tsibble)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(tidyr)
+library(patchwork)
+library(lubridate)
+library(knitr)
+library(fpp3)
+library(psych)
+```
+
+### **SECTION 1:**
+
+| The time series dataset analyzed in the below assignment is Traffic Crash Reports recorded in the event of a Cincinnati Police Department response to a traffic crash, which includes records of data, injury and non-injury crashes. The dataset is updated on a daily basis and is available to the public through the city's Open Data portal.
+| 
+| The data-generation process is performed by recording the event of CPD responding to a traffic crash. The variation in variable (number of crashes) is reliant on a number of factors - traffic patterns, weather, attention of the rider, road conditions and many more. In my opinion, this is a difficult variable to forecast, owing to the complexity of traffic dynamics and the influence of external factors. Furthermore, having different types of crashes makes it more difficult to predict an identifiable pattern.
+
+```{r}
+accidents <- read.csv("C:\\Users\\kowsa\\Downloads\\cpd_crashes.csv")
+
+
+accidents$date <- ymd(accidents$date)
+
+accidents_tsbl<- accidents %>%
+as_tsibble(index=date) %>%
+mutate(date = ymd(accidents$date))
+
+# accidents
+# 
+# accidents <- accidents %>% 
+#   group_by(month = lubridate::floor_date(date, 'month')) %>%
+#   summarize(cpd_crashes = sum(cpd_crashes))
+# 
+#  
+# accidents_tsbl <- accidents %>%
+#   mutate(month = yearmonth(month)) %>%
+#   as_tsibble(index = date)
+# 
+# accidents_tsbl
+# 
+
+accidents_tsbl
+
+
+
+```
+
+The data-frame has been converted to a 'tsibble' format to handle date functions. Let's plot the number of traffic crashes against each day of the year.
+
+```{r}
+
+accidents_plot <- accidents_tsbl %>%
+  ggplot() +
+  geom_line(aes(date, cpd_crashes)) +
+  theme_bw() +
+  xlab("Date") +
+  ylab("Traffic Crashes in Cincinnati") +
+  ggtitle("Number of traffic crashes over time")
+
+accidents_plot
+
+```
+
+### SECTION 2:
+
+| From the summary statistics below, we can see that the median and mean are not close to each other, suggesting skewness in the data. The maximum value is 189, which seems to be fairly relieving as compared to most other cities.
+
+```{r}
+summary_stat <- round(t(describe(accidents_tsbl$cpd_crashes)),2)
+
+summary_stat <- cbind('Summary Statistics are ' = rownames(summary_stat), summary_stat)
+row.names(summary_stat) <- NULL
+colnames(summary_stat) <- c('Summary Statistics','Value')
+summary_stat[-c(1,12),]  %>%
+  kbl(align=rep('c', 2)) %>%
+  kable_styling()
+```
+
+```{r}
+hist <- accidents_tsbl %>%
+  ggplot() +
+  geom_histogram(aes(cpd_crashes)) +
+  theme_bw()
+
+dens <- accidents_tsbl %>%
+  ggplot() +
+  geom_density(aes(cpd_crashes)) +
+  theme_bw()
+
+violin <- accidents_tsbl %>%
+  ggplot() +
+  geom_violin(aes("", cpd_crashes)) +
+  theme_bw()
+
+boxplot <- accidents_tsbl %>%
+  ggplot() +
+  geom_boxplot(aes("", cpd_crashes)) +
+  theme_bw()
+
+hist + violin + dens + boxplot +  plot_annotation(title = 'Density plots for Cincinnati traffic crashes')
+```
+
+-   As expected, the histogram above is right-skewed with a long tail, and follows an almost-normal distribution with a sudden peak.
+
+-   The density graph also shows a right-tailed normal distribution.
+
+-   The box-plot shows a few outliers which may be the reason for skewness in the data.
+
+-   From the violin plot, we can infer that there is higher density of traffic crashes around the value 75.
+
+-   There seems to be a decrease in the number of traffic crashes lately. However, there does not seem to be a clear trend in the data yet.
+
+### SECTION 3:
+
+| Before visualizing moving averages, let's perform rolling standard deviation to check for the variance trend. From below plot, we can observe that there are multiple peaks and fall, however, there is no increasing or decreasing trend implying an overall constant variance.
+
+```{r}
+#Rolling standard deviation
+
+accidents_tsbl %>%
+mutate(
+  sd = slider::slide_dbl(cpd_crashes, sd,.before = 3, .after = 3, .complete = TRUE)
+) %>%
+ggplot()+
+geom_line(aes(date,sd),linewidth=0.5,na.rm=TRUE)+
+ggtitle('Rolling Standard Deviation of Cincinnati Crashes',
+subtitle = 'Long-term Variance Fairly Constant with some fluctuations')+ theme_bw() +
+ylab('Weekly Rolling Standard Deviation')
+```
+
+As there are many peaks and valleys, we can perform transformations to reduce the variance in the data. Log transformation has been performed as shown below, and we can see the density curve showing satisfactory results. Hence, we can proceed with the log-transformed value of the number of crashes.
+
+```{r}
+#Performing transformations to reduce variance
+density = accidents_tsbl %>%
+ggplot()+
+geom_density(aes(cpd_crashes))+
+geom_vline(aes(xintercept=mean(cpd_crashes)),linetype='dashed',color='red')
+
+line = accidents_tsbl %>%
+ggplot()+
+geom_line(aes(date,cpd_crashes))+
+geom_smooth(aes(date,cpd_crashes),method='lm')
+
+log_density = accidents_tsbl %>%
+ggplot()+
+geom_density(aes(log(cpd_crashes)))+
+geom_vline(aes(xintercept=mean(log(cpd_crashes))),linetype='dashed',color='red')
+
+log_line = accidents_tsbl %>%
+ggplot()+
+geom_line(aes(date,log(cpd_crashes)))+
+geom_smooth(aes(date,log(cpd_crashes)),method='lm')
+
+
+density + line + log_density + log_line+ plot_layout(ncol = 2, byrow = TRUE) + plot_annotation(title = "Comparison of Density and Line Plots before/after Log Transformation")
+
+accidents_tsbl <- accidents_tsbl %>%
+mutate(accidents_log = log(cpd_crashes))
+accidents_tsbl
+
+```
+
+We can now perform moving averages on the log-transformed data. Intuitively, moving average of 7th order would be an ideal choice, given the nature of our data. Let's plot to compare the moving averages.
+
+```{r}
+#| warning: false
+
+accidents_tsbl_ma <- accidents_tsbl %>%
+  arrange(date) %>%
+  mutate(
+    ma_right = slider::slide_dbl(accidents_log, mean,
+                .before = 12, .after = 0, .complete = TRUE),
+    ma_left = slider::slide_dbl(accidents_log, mean,
+                .before = 0, .after = 12, .complete = TRUE),
+    ma_center = slider::slide_dbl(accidents_log, mean,
+                .before = 6, .after = 6, .complete = TRUE),
+    ma_3 = slider::slide_dbl(accidents_log, mean,
+                .before = 1, .after = 1, .complete = TRUE),
+    ma_5 = slider::slide_dbl(accidents_log, mean,
+                .before = 2, .after = 2, .complete = TRUE),
+    ma_7 = slider::slide_dbl(accidents_log, mean,
+                .before = 3, .after = 3, .complete = TRUE),
+    ma_13 = slider::slide_dbl(accidents_log, mean,
+                .before = 6, .after = 6, .complete = TRUE),
+    ma_25 = slider::slide_dbl(accidents_log, mean,
+                .before = 12, .after = 12, .complete = TRUE),
+    ma_49 = slider::slide_dbl(accidents_log, mean,
+                .before = 24, .after = 24, .complete = TRUE))
+  
+
+accidents_tsbl_ma_pivot <- accidents_tsbl_ma %>%
+  pivot_longer(
+    cols = ma_right:ma_49,
+    values_to = "value_ma",
+    names_to = "ma_order"
+  ) %>%
+  mutate(ma_order = factor(
+    ma_order,
+    levels = c(
+      "ma_center",
+      "ma_left",
+      "ma_right",
+      "ma_3",
+      "ma_5",
+      "ma_7",
+      "ma_13",
+      "ma_25",
+      "ma_49"
+    ),
+    labels = c(
+      "ma_center",
+      "ma_left",
+      "ma_right",
+      "ma_3",
+      "ma_5",
+      "ma_7",
+      "ma_13",
+      "ma_25",
+      "ma_49"
+    )
+  ))
+
+accidents_tsbl_ma %>%
+  ggplot() +
+  geom_line(aes(date, accidents_log), linewidth =0.5, color="black") +
+  geom_line(aes(date, ma_7), linewidth = 0.75, color = "red") +
+  geom_smooth(aes(date, accidents_log), method = "lm", se = F, color = "blue") +
+  theme_bw()+
+  ylab('CPD crashes')+ ggtitle("Estimation of Moving Averages")
+
+```
+
+Now, let's plot the moving averages with 7th and 13th order to compare which fits better.
+
+```{r}
+#Moving averages with order
+accidents_tsbl_ma_pivot %>%
+  filter(
+    !ma_order %in% c(
+      "ma_center",
+      "ma_left",
+      "ma_right",
+      "ma_3",
+      "ma_5",
+      "ma_25",
+      "ma_49"
+    )
+  ) %>%
+  mutate(ma_order = case_when(
+    ma_order=='ma_7' ~ '7th Order',
+    ma_order=='ma_13'~'13th Order'
+
+   )
+  ) %>%
+  mutate(
+    ma_order = factor(
+      ma_order,
+      labels = c(
+       '7th Order',
+      '13th Order'),
+      
+      levels = c(
+      '7th Order',
+       '13th Order'
+     )
+    )
+  ) %>%
+  ggplot() +
+  geom_line(aes(date, accidents_log), size = 0.5,na.rm=TRUE) +
+  geom_line(aes(date, value_ma, color = ma_order), size = 0.75,na.rm=TRUE,se=F) +
+    scale_color_discrete(name = 'MA Order')+
+  theme_minimal()+
+  ylab('Cincinnati Traffic crashes')+ ggtitle("Comparison of moving averages of different orders",subtitle = "Moving average of 7th order fits better")
+```
+
+From the above graph, we can conclude that 7th order Moving average seems to fit the best among all other orders.
+
+Now, let's perform linear regression to fit our data appropriately.
+
+```{r}
+#| warning: false
+#Linear model
+accidents_tsbl_ma %>%
+  ggplot() +
+  geom_line(aes(date, ma_7)) +
+  geom_smooth(aes(date, ma_7), method = "lm", color = "red")+ 
+  theme_bw() +
+  xlab("Date") +
+  ylab("Cincinnati crashes")
+
+accidents_mod <- lm(accidents_log~ date, data = accidents_tsbl)
+summary(accidents_mod)
+
+```
+
+Since linear model does not really fit our data appropriately, let's try fitting a polynomial function instead.
+
+```{r}
+ggplot(accidents_tsbl, aes(x = date, y = accidents_log)) +
+  geom_line() +
+  # Plot the fitted curve from the polynomial regression model
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3), se = FALSE, color = "blue") +
+  # Other plot customization options
+  labs(title = "Polynomial Regression of accidents_log",
+       x = "Date",
+       y = "accidents_log") +
+  theme_minimal()
+accidents_mod2 <- lm(accidents_log ~ poly(date,3), data = accidents_tsbl)
+summary(accidents_mod2)
+```
+
+Let's calculate the residuals of our fitted model, just to visualize the behaviour. We do not see a particular trend in the residuals.
+
+```{r}
+accidents_resid = accidents_tsbl %>%
+  mutate(
+    pred = predict(accidents_mod2),
+    resid = pred - accidents_log
+  ) 
+
+accidents_resid_plot = accidents_resid %>%
+  ggplot() +
+  geom_line(aes(date, resid),na.rm=TRUE)+
+  theme_bw()+
+  ylab('Residuals') + ggtitle(" Plot of residuals from Polynomial Model")
+
+accidents_resid_plot
+
+```
+
+Classical decomposition has been performed for the dataset to separate the trend, seasonality and residuals from the data as seen below. From the remainder component, we can see that there seems to be very weak seasonality in the data which can be modeled. This is not surprising as we would not expect the traffic crashes to be seasonal, rather random.
+
+```{r}
+accidents_decomp <- accidents_tsbl %>%
+  mutate(
+    ma_7 = slider::slide_dbl(accidents_log, mean,
+                .before = 3, .after = 3, .complete = TRUE),
+  ) %>%
+  mutate(resid = accidents_log - ma_7) %>%
+  select(date, accidents_log, ma_7, resid)
+
+accidents_decomp_plot <- accidents_decomp %>%
+  pivot_longer(
+    accidents_log:resid,
+    names_to = "decomposition",
+    values_to = "accidents_log"
+  ) %>%
+  mutate(
+    decomposition = case_when(
+      decomposition == "accidents_log" ~ "Cincinnati crashes",
+      decomposition == "ma_7" ~ "Trend",
+      decomposition == "resid" ~ "Remainder"
+    )
+  ) %>%
+  mutate(
+    decomposition = factor(
+      decomposition,
+      labels = c(
+        "Cincinnati crashes",
+        "Trend",
+        "Remainder"
+      ),
+      levels = c(
+        "Cincinnati crashes",
+        "Trend",
+        "Remainder"
+      )
+    )
+  ) %>%
+  ggplot() +
+  geom_line(aes(date, accidents_log), size = 0.75,na.rm=TRUE) +
+  facet_wrap(
+    ~decomposition,
+    nrow = 3,
+    scales = "free"
+  ) +
+  theme_bw() +
+  ylab("") +
+  xlab("Date") +
+  ggtitle(
+    "Cincinnati Traffic crashes = Trend + Remainder"
+  )
+
+accidents_decomp_plot
+```
+
+For further analysis, let's plot the additive seasonality to better visualize the decomposition and other trends in the data.
+
+```{r}
+accidents_add = accidents_tsbl %>%
+  model(
+    classical_decomposition(accidents_log, 'additive')
+  ) %>%
+  components()
+
+accidents_add%>%
+  autoplot()
+
+```
+
+From the lag plots below, we can see that there is negligible seasonality, however we cannot strongly conclude the seasonality based on the decomposition model, as it outputs seasonality even when it is non-existent in the time series. From the below plot, we can presume additive seasonality (however minimum it is).
+
+```{r}
+accidents_add %>%
+  gg_lag(random, geom = "point", lags = 1:12)+
+  geom_smooth(aes(color=NULL),method='lm',color='red',se=F)
+```
+
+Multiplicative seasonality plots do not show a significant change from that of additive plot. This shows that whatever seasonality that exists is well described by our additive model.
+
+```{r}
+accidents_mul = accidents_tsbl %>%
+  model(
+    classical_decomposition(accidents_log,'multiplicative')
+  ) %>%
+  components() 
+
+accidents_mul %>%
+  autoplot()
+```
+
+```{r}
+accidents_decomp %>%
+  mutate(month = month(date)) %>%
+  ggplot() +
+  geom_boxplot(aes(factor(month), resid)) +
+  theme_bw() +
+  ylab('Remainder') +
+  xlab('Month') +
+  scale_x_discrete(labels = month.name) +
+  labs(title = 'Boxplot of Remainder by Month')
+```
+
+```{r}
+accidents_decomp %>%
+  mutate(week = week(date)) %>%
+  ggplot() +
+  geom_boxplot(aes(factor(week), resid)) +
+  theme_bw() +
+  ylab('Remainder') +
+  xlab('Week') +
+  labs(title = 'Boxplot of Remainder by Week') +
+    geom_hline(yintercept=0,color='red') +  theme(axis.text.x = element_text(angle = 45, hjust = 1.5))
+  
+
+```
+
+From the above graph, we can see that there is very less/negligible seasonality left in the remainder component of the de-trended data.
+
+```{r}
+accidents_tsbl %>%
+mutate(ma = slider::slide_dbl(accidents_log, mean,
+                .before = 3, .after = 3, .complete = TRUE)) %>%
+mutate(detrend = accidents_log - ma) %>%
+mutate(month = lubridate::month(date,label=T,abbr=T)) %>%
+  ggplot()+
+  geom_boxplot(aes(month,detrend))+
+  geom_hline(yintercept=0,color='red') + ggtitle("Boxplot of detrended data ")
+```
+
+From this, we can conclude that there is not much seasonality in the data.
+
+### SECTION 4:
+
+Let's plot naive forecast to see the future trend for the next 6 days. (Optionally, we may also predict for next 6 months, however I have chosen to predict for the next 6 days.)
+
+```{r}
+accidents_tsbl %>%
+  model(
+    Naive = NAIVE(accidents_log)
+  ) %>%
+  forecast(h = 6) %>%
+  autoplot(accidents_tsbl, level = NULL,size=1) +
+  geom_vline(aes(xintercept = ymd("2023-12-31")), color = "red", linetype = "dashed") +
+  theme_bw()+
+  ylab('Cincinnati crashes')+ ggtitle("Naive forecast")
+```
+
+```{r}
+
+drift_lm_data = accidents_tsbl 
+
+drift_lm = lm(data = drift_lm_data,accidents_log~date)
+
+drift_lm_pred = accidents_tsbl %>%
+  mutate(pred = predict(drift_lm,newdata=accidents_tsbl))
+
+
+accidents_tsbl %>%
+  model(
+    Naive = NAIVE(accidents_log~drift())
+  ) %>%
+  forecast(h = 6) %>%
+  autoplot(accidents_tsbl, level = NULL,size=1) +
+  geom_vline(aes(xintercept = ymd("2023-12-31")), color = "red", linetype = "dashed") +
+  geom_line(data=drift_lm_pred,aes(date,pred),color='blue',linetype='dashed')+
+  theme_bw()+
+  ylab('Cincinnati traffic crashes')+ ggtitle("Naive with drift forecast")
+```
+
+Upon comparison of the two plots, we do not see much of a difference in the performance of both the forecasts. Hence, we can conclude that a naive forecast is sufficient to predict our model trend.

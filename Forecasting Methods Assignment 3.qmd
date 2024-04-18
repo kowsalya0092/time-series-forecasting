@@ -1,0 +1,309 @@
+---
+title: "Forecasting Methods Assignment 3"
+author: "Kowsalya Muralidharan"
+format: 
+  html:
+    fig-align: center # Center figure alignment
+    embed-resources: true # Force document to be self-contained (critical!)
+    code-fold: true # Turn on code fold
+    toc: true # Create table of contents
+self-contained: TRUE
+editor: visual
+embed-resources: true
+execute: 
+  warning: false # Turn off warnings
+---
+
+#### SECTION - 1
+
+> | Assess the behavior/data-generating process of your time-series using the techniques discussed in class. From your understanding of the process, would you expect the time-series to be mean stationary? Variance stationary? Why or why not?
+> | If the data appear to be variance non-stationary (using a rolling SD or other method), transform your time-series using a natural log or Box-Cox transformation.
+> | If seasonality is present in your data, use seasonal differencing to remove the seasonal effect (for example, for monthly data estimate the difference as ).
+> | Conduct and interpret a KPSS test for stationarity after performing the above operations (if necessary). Do the results suggest that the process is mean stationary? If the process is mean non-stationary, calculate difference the data until mean stationary (after log/Box-Cox and seasonal differencing) and visualize it.
+
+```{r}
+#| warning: false
+library(slider)
+library(lubridate)
+library(tsibble)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+library(tidyr)
+library(patchwork)
+library(lubridate)
+library(knitr)
+library(fpp3)
+library(psych)
+#install.packages("urca")
+library(forecast)
+library(urca)
+```
+
+```{r}
+accidents <- read.csv("C:\\Users\\kowsa\\Downloads\\cpd_crashes.csv")
+
+
+accidents$date <- ymd(accidents$date)
+
+accidents_tsbl<- accidents %>%
+as_tsibble(index=date) %>%
+mutate(date = ymd(accidents$date))
+
+accidents_tsbl
+
+start_date <- as.Date("2023-01-01")
+end_date <- as.Date("2023-12-31")
+
+# Filter data for the desired time period
+accidents_new <- accidents_tsbl %>%
+  filter(date >= start_date & date <= end_date)
+
+
+
+```
+
+```{r}
+#Rolling standard deviation
+
+accidents_new %>%
+mutate(
+  sd = slider::slide_dbl(cpd_crashes, sd,.before = 3, .after = 3, .complete = TRUE)
+) %>%
+ggplot()+
+geom_line(aes(date,sd),linewidth=0.5,na.rm=TRUE)+
+ggtitle('Rolling Standard Deviation of Cincinnati Crashes',
+subtitle = 'Long-term Variance Fairly Constant with some fluctuations')+ theme_bw() +
+ylab('Weekly Rolling Standard Deviation')
+```
+
+-   As there are many peaks and valleys, we can perform transformations to reduce the variance in the data.
+
+-   Log transformation has been performed as shown below, and we can see the density curve showing satisfactory results. Hence, we can proceed with the log-transformed value of the number of crashes.
+
+```{r}
+#Performing transformations to reduce variance
+density = accidents_tsbl %>%
+ggplot()+
+geom_density(aes(cpd_crashes))+
+geom_vline(aes(xintercept=mean(cpd_crashes)),linetype='dashed',color='red')
+
+line = accidents_tsbl %>%
+ggplot()+
+geom_line(aes(date,cpd_crashes))+
+geom_smooth(aes(date,cpd_crashes),method='lm')
+
+log_density = accidents_tsbl %>%
+ggplot()+
+geom_density(aes(log(cpd_crashes)))+
+geom_vline(aes(xintercept=mean(log(cpd_crashes))),linetype='dashed',color='red')
+
+log_line = accidents_tsbl %>%
+ggplot()+
+geom_line(aes(date,log(cpd_crashes)))+
+geom_smooth(aes(date,log(cpd_crashes)),method='lm')
+
+
+density + line + log_density + log_line+ plot_layout(ncol = 2, byrow = TRUE) + plot_annotation(title = "Comparison of Density and Line Plots before/after Log Transformation")
+
+accidents_tsbl <- accidents_tsbl %>%
+mutate(accidents_log = log(cpd_crashes))
+accidents_tsbl
+
+```
+
+Now let's check if it is mean stationary.
+
+```{r}
+accidents_tsbl_roll <- accidents_tsbl %>%
+  mutate(
+    accidents_mean = slide_dbl(
+      cpd_crashes, 
+      mean,
+      .before=6,
+      .after=6,
+      .complete=T),
+    accidents_sd = slide_dbl(
+      cpd_crashes, 
+      sd,
+      .before=6,
+      .after=6)
+  )
+
+accidents_tsbl_roll_mean <- accidents_tsbl_roll %>%
+  ggplot() +
+    geom_line(aes(date, cpd_crashes)) +
+  geom_line(aes(date, accidents_mean),color='blue') +
+  theme_bw() +
+  ggtitle("Cincinnati Crashes over Time (12 month rolling window)") +
+  ylab("Accidents") +
+  xlab("Date")
+
+accidents_tsbl_roll_mean
+
+```
+
+It seems to be mean stationary. Let's conduct the KPSS Test for stationarity.
+
+```{r}
+accidents_diff <- accidents_tsbl %>%
+  mutate(
+    accidents_log = log1p(cpd_crashes),
+    cpd_diff = cpd_crashes - lag(cpd_crashes),
+    accidents_log_diff = accidents_log - lag(accidents_log)) %>%
+  drop_na() %>%
+  as_tsibble(index=date)
+
+# Raw close value - Non-stationary
+raw_value_kpss = accidents_diff %>% 
+features(cpd_crashes, unitroot_kpss)
+
+# First difference - **Non-stationary**
+diff_value_kpss = accidents_diff %>% 
+features(cpd_diff, unitroot_kpss)
+
+# Log close value - Non-stationary
+log_value_kpss = accidents_diff %>%
+features(accidents_log, unitroot_kpss)
+
+# Differenced log close value - Stationary
+log_diff_kpss = accidents_diff %>%
+features(accidents_log_diff, unitroot_kpss)
+
+log_value_kpss
+```
+
+Since the p-value in the KPSS test is \> 0.05, we can conclude that the time series is mean stationary. This means we do not need to perform any additional steps to induce mean stationarity in the series.
+
+```{r}
+
+accidents_tsbl %>%
+  gg_tsdisplay(difference(log(cpd_crashes),12),
+               plot_type='partial', lag=24) +
+  labs(title="Seasonally differenced (log)", y="")
+```
+
+Even though there is a significant spike, we cannot conclude there is significant seasonality in our time-series.
+
+#### SECTION 2
+
+| Produce and interpret ACF/PACF plots of the transformed time series after the above operations. Based on the ACF/PACF alone, does the time-series appear to be an autoregressive process, moving average process, combined, or neither? What might you suspect the order of the time-series to be (e.g. ARIMA(0,1,2)) using the ACF/PACF plots and stationarity tests? If the data contain a seasonal component, describe any seasonal ARIMA effects (PDQ) that may be interpretable from the ACF/PACF plots.
+
+```{r}
+accidents_tsbl %>%
+  gg_tsdisplay(accidents_log, plot_type = 'partial', lag = 24) +
+  labs(title = "CPD crashes", y = "")
+```
+
+-   As we can see dampening effect in the ACF plot, we can conclude that the log-transformed time series is an auto-regressive process.
+
+-   The PACF plot shows the first lag period captures the most significant portion of the auto-regressive property, so it could be AR(1) process.
+
+-   Since there was no differencing applied above, we propose that a model of ARIMA(1,0,0) would be reasonable for this time series.There is no significant seasonality in our time series as concluded earlier.
+
+#### SECTION 3
+
+| Fit several ARIMA models to your time-series variable based on the "best guesses" above. Which model is the "best" according to the AIC or BIC? After comparing several models, implement the automated ARIMA function from fable to find the "best" model. Does the automated ARIMA function select the same model as you did? If not, why do you think this is the case?
+| After selecting the best model, derive the fitted values for the time series and plot them against the observed values of the series. Do the in-sample predicted values tend to follow the trends in the data?
+
+```{r}
+# Automatic Differencing using fable
+accidents_tsbl %>%
+  model(
+    ARIMA(log(cpd_crashes)~pdq(1,0,0))
+  ) %>%
+  report()
+```
+
+Now let's build and compare few models.
+
+```{r}
+models_bic = accidents_tsbl %>%
+  model(
+    mod1 = ARIMA(log(cpd_crashes)~pdq(0,1,0)+ PDQ(0,0,0)),
+    mod2 = ARIMA(log(cpd_crashes)~pdq(0,1,1)+ PDQ(0,0,0)),
+    mod3 = ARIMA(log(cpd_crashes)~pdq(1,1,0)+ PDQ(0,0,0)),
+    mod4 = ARIMA(log(cpd_crashes)~pdq(1,0,0)+ PDQ(0,0,0))
+  )
+
+models_bic %>%
+  glance() %>%
+  arrange(BIC)
+```
+
+Based on the BIC, Model 4 (1,0,0)(0,0,0) is the best. Now let's run ARIMA function to see if it matches our expectation.
+
+```{r}
+best_mod<- accidents_tsbl %>%
+model(
+  ARIMA(log(cpd_crashes) ~ PDQ(0,0,0),approximation=F)
+) %>%
+report()
+```
+
+ARIMA has selected (1,0,0) as the best model, which is in sync with Model 4 which was selected on the basis of least BIC.
+
+```{r}
+#best_model<- ARIMA(log(cpd_crashes)~pdq(1,0,0)+ PDQ(1,0,0))
+# Assuming 'cpd_crashes' is your time series data
+
+
+# Fit ARIMA model
+best_model <- auto.arima(log(accidents_tsbl$cpd_crashes))
+
+# Obtain fitted values
+fitted <- fitted(best_model)
+
+
+ggplot() +
+  geom_line(aes(accidents_tsbl$date, accidents_tsbl$accidents_log)) + 
+  geom_line(aes(accidents_tsbl$date, fitted),color="blue") +
+  theme_bw() +
+  xlab("Date") +
+  ylab("Number of Crashes")+
+  ggtitle("Fitted values vs. Observed values")
+    
+```
+
+The in-sample predicted values tend to follow the trends in the data.
+
+#### SECTION 4
+
+| Compute and analyze the residuals from the selected model. Conduct a Box-Ljung test for residual autocorrelation and examine the ACF/PACF plots in the residuals. Do the residuals appear to be white noise? If the residuals do not appear to be white noise, either interpret your results (or lack thereof) or suggest a possible solution to the problem.
+| Finally, create a 6 time-period forecast for your model from the end of the data. Do the forecasted values seem reasonable? Why or why not?
+
+```{r}
+best_mod %>%
+  gg_tsresiduals()
+```
+
+-   From the above plot, we can see that the residuals are normally distributed.
+
+-   The model is well-fitted as we do not see any significant autocorrelation at lag 1 in the ACF plot.
+
+-   There does not appear to be any seasonality in the ACF residual plot.
+
+    Now, let's perform the Ljung-Box Test to check for any leftover autocorrelation in the residuals.
+
+    ```{r}
+    best_mod %>%
+      augment() %>%
+      features(.innov, ljung_box, lag = 10, dof = 1)
+    ```
+
+    The p-value is \> 0.05, indicating that there is not residual auto-correlation and that the residuals are white noise.
+
+    ```{r}
+    accidents_tsbl %>%
+      model(
+        ARIMA(log(cpd_crashes),approximation=F) # Didn't set stepwise here because of size of the data
+      ) %>%
+      forecast(h=6) %>%
+      autoplot(
+        accidents_tsbl %>%
+        filter(date>=ymd('2023-12-01'))
+      )+
+      theme_bw() + ggtitle("6 day forecast of CPD crashes")
+    ```
+
+    The forecast values does seem reasonable, given the beginning of new year 2024, there may be more traffic and visitors in Cincinnati, leading to more number of potential crashes.
